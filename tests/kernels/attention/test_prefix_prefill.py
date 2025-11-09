@@ -8,10 +8,7 @@ from collections.abc import Callable
 
 import pytest
 import torch
-from xformers import ops as xops
-from xformers.ops.fmha.attn_bias import BlockDiagonalCausalFromBottomRightMask
-
-from tests.kernels.utils import make_alibi_bias
+import torch.nn.functional as F
 from vllm.attention.ops.chunked_prefill_paged_decode import chunked_prefill_paged_decode
 from vllm.attention.ops.prefix_prefill import context_attention_fwd
 from vllm.platforms import current_platform
@@ -26,6 +23,144 @@ SLIDING_WINDOW = [0, 16, 2048]
 KV_CACHE_DTYPES = ["auto", "fp8", "fp8_e5m2"]
 
 OPS = [chunked_prefill_paged_decode, context_attention_fwd]
+
+
+def _build_sdpa_mask(
+    num_heads: int,
+    ctx_len: int,
+    query_len: int,
+    seq_len: int,
+    sliding_window: int,
+    device: torch.device,
+    alibi_slopes: torch.Tensor | None,
+) -> torch.Tensor:
+    """Construct an attention mask that matches vLLM's prefix prefill rules.
+
+    The Triton kernels only allow each query token to attend to:
+
+    * The *entire* context (``ctx_len`` tokens) that has already been
+      prefetched into KV cache.
+    * Its own prefix tokens when we are doing sliding window attention.
+
+    In PyTorch's SDPA API the mask is additive, so we fill the disallowed
+    locations with ``-inf`` and the allowed ones with ``0``.
+    """
+    mask = torch.full(
+        (query_len, seq_len), float("-inf"), device=device, dtype=torch.float32
+    )
+    for query_idx in range(query_len):
+        # Every new query token can look at all prior context plus the tokens
+        # generated within the sliding window immediately before it.
+        allowed_end = ctx_len + query_idx + 1
+        if sliding_window > 0:
+            allowed_start = max(0, allowed_end - sliding_window)
+        else:
+            allowed_start = 0
+        allowed_start = min(allowed_start, allowed_end)
+        mask[query_idx, allowed_start:allowed_end] = 0.0
+
+    # Expand to ``(num_heads, query_len, seq_len)`` so SDPA can broadcast the
+    # mask per attention head, then add an explicit batch dimension.
+    attn_mask = mask.unsqueeze(0).expand(num_heads, -1, -1).clone()
+
+    if alibi_slopes is not None:
+        # When ALiBi is enabled the mask carries both the additive ``-inf``
+        # entries *and* the positional bias.  SDPA expects the bias to be of
+        # shape ``(num_heads, query_len, seq_len)``, so we compute it here and
+        # add it into the mask tensor we already created.
+        pos_q = torch.arange(
+            ctx_len,
+            ctx_len + query_len,
+            device=device,
+            dtype=torch.float32,
+        )
+        pos_k = torch.arange(seq_len, device=device, dtype=torch.float32)
+        bias = pos_q[:, None] - pos_k[None, :]
+        attn_mask += alibi_slopes.to(torch.float32)[:, None, None] * bias
+
+    return attn_mask.unsqueeze(0)
+
+
+def _sdpa_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_lens: list[int],
+    ctx_lens: list[int],
+    seq_lens: list[int],
+    num_heads: int,
+    num_kv_heads: int,
+    num_queries_per_kv: int,
+    head_size: int,
+    sliding_window: int,
+    alibi_slopes: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run a SDPA forward pass that mirrors the Triton prefix prefill kernel.
+
+    The prefix prefill kernel processes a flattened batch of requests where the
+    context tokens are already in KV cache.  To produce a numerically comparable
+    result we replicate the same data layout manipulations here before calling
+    ``torch.nn.functional.scaled_dot_product_attention``.
+    """
+    output_ref = torch.empty_like(query)
+
+    query_offset = 0
+    key_offset = 0
+
+    for ctx_len, query_len, seq_len in zip(ctx_lens, query_lens, seq_lens):
+        # Slice out a single request from the flattened batch.  The Triton
+        # kernels operate on flattened tensors, so we mimic that layout rather
+        # than reshaping into ``(batch, time, head, dim)`` as a user-facing
+        # model would do.
+        q_slice = query[query_offset:query_offset + query_len]
+        k_slice = key[key_offset:key_offset + seq_len]
+        v_slice = value[key_offset:key_offset + seq_len]
+
+        if num_kv_heads != num_heads:
+            # Multi-query attention stores fewer KV heads than attention heads.
+            # The CUDA kernels internally broadcast the cached KV heads across
+            # all query heads, so we reproduce the exact expansion here to keep
+            # the SDPA reference aligned with the Triton implementation.
+            k_slice = k_slice[:, :, None, :].expand(
+                seq_len, num_kv_heads, num_queries_per_kv, head_size
+            )
+            k_slice = k_slice.reshape(seq_len, num_heads, head_size).contiguous()
+            v_slice = v_slice[:, :, None, :].expand(
+                seq_len, num_kv_heads, num_queries_per_kv, head_size
+            )
+            v_slice = v_slice.reshape(seq_len, num_heads, head_size).contiguous()
+
+        # SDPA expects the shape ``(batch, num_heads, time, head_size)``.  We
+        # treat each request as a batch of size one to match the Triton kernel
+        # semantics where batches do not interact.
+        q_formatted = q_slice.permute(1, 0, 2).unsqueeze(0)
+        k_formatted = k_slice.permute(1, 0, 2).unsqueeze(0)
+        v_formatted = v_slice.permute(1, 0, 2).unsqueeze(0)
+
+        attn_mask = _build_sdpa_mask(
+            num_heads,
+            ctx_len,
+            query_len,
+            seq_len,
+            sliding_window,
+            q_slice.device,
+            alibi_slopes,
+        )
+
+        attn_output = F.scaled_dot_product_attention(
+            q_formatted,
+            k_formatted,
+            v_formatted,
+            attn_mask=attn_mask,
+        )
+        attn_output = attn_output.squeeze(0).permute(1, 0, 2).contiguous()
+
+        output_ref[query_offset:query_offset + query_len] = attn_output
+
+        query_offset += query_len
+        key_offset += seq_len
+
+    return output_ref
 
 
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
@@ -187,58 +322,24 @@ def test_contexted_kv_attention(
     end_time = time.time()
     print(f"triton Time: {(end_time - start_time) * 1000:.2f} ms")
 
-    scale = float(1.0 / (head_size**0.5))
-
-    attn_op = xops.fmha.cutlass.FwOp()
-
-    if num_kv_heads != num_heads:
-        # As of Nov 2023, xformers only supports MHA. For MQA/GQA,
-        # project the key and value tensors to the desired number of
-        # heads.
-        #
-        # see also: vllm/model_executor/layers/attention.py
-        query = query.view(
-            query.shape[0], num_kv_heads, num_queries_per_kv, query.shape[-1]
-        )
-        key = key[:, :, None, :].expand(
-            key.shape[0], num_kv_heads, num_queries_per_kv, key.shape[-1]
-        )
-        value = value[:, :, None, :].expand(
-            value.shape[0], num_kv_heads, num_queries_per_kv, value.shape[-1]
-        )
-    query = query.unsqueeze(0)
-    key = key.unsqueeze(0)
-    value = value.unsqueeze(0)
-
-    attn_bias = BlockDiagonalCausalFromBottomRightMask.from_seqlens(
-        query_lens, seq_lens
-    )
-    if sliding_window > 0:
-        attn_bias = attn_bias.make_local_attention_from_bottomright(sliding_window)
-    output_ref = xops.memory_efficient_attention_forward(
-        query,
-        key,
-        value,
-        attn_bias=attn_bias,
-        p=0.0,
-        scale=scale,
-        op=attn_op,
-    )
     torch.cuda.synchronize()
     start_time = time.time()
-    output_ref = xops.memory_efficient_attention_forward(
+    output_ref = _sdpa_reference(
         query,
         key,
         value,
-        attn_bias=attn_bias,
-        p=0.0,
-        scale=scale,
-        op=attn_op,
+        query_lens,
+        ctx_lens,
+        seq_lens,
+        num_heads,
+        num_kv_heads,
+        num_queries_per_kv,
+        head_size,
+        sliding_window,
     )
     torch.cuda.synchronize()
     end_time = time.time()
-    print(f"xformers Time: {(end_time - start_time) * 1000:.2f} ms")
-    output_ref = output_ref.reshape(output.shape)
+    print(f"sdpa Time: {(end_time - start_time) * 1000:.2f} ms")
     atol = 1e-3 if "fp8" in kv_cache_dtype else 1e-4
     torch.testing.assert_close(output, output_ref, atol=atol, rtol=0)
 
@@ -275,6 +376,7 @@ def test_contexted_kv_attention_alibi(
     torch.cuda.set_device(device)
 
     def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
+        """Reproduce the ALiBi slope schedule used by BLOOM-style models."""
         # Fork from: vllm/vllm/model_executor/models/bloom.py#L44
         closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
         base = torch.tensor(
@@ -338,7 +440,10 @@ def test_contexted_kv_attention_alibi(
     b_ctx_len = torch.tensor(ctx_lens, dtype=torch.long)
     b_start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.long), dim=0)
     max_input_len = MAX_SEQ_LEN
-    # copy kv to cache
+    # Copy the first ``ctx_len`` tokens from every request into the paged KV
+    # cache.  This mirrors the behavior in production inference where the
+    # prefix context is resident in cache before we run the prefix prefill
+    # kernel.
     b_seq_start_loc = torch.cumsum(
         torch.tensor([0] + seq_lens[:-1], dtype=torch.long), dim=0
     )
@@ -364,8 +469,9 @@ def test_contexted_kv_attention_alibi(
             )
             cur_ctx += block_size
             block_id += 1
-    # transpose K_cache[num_blocks, block_size, num_kv_heads, head_size]
-    # to K_cache[num_blocks, num_kv_heads, head_size/8, block_size, 8]
+    # Transpose the dense caches into the memory layout expected by the
+    # Triton kernels.  The reshapes match the exact transformations inside the
+    # implementation so the SDPA reference is compared against the same inputs.
     k_cache = (
         k_cache.view(-1, block_size, num_kv_heads, head_size // 8, 8)
         .permute(0, 2, 3, 1, 4)
@@ -421,80 +527,25 @@ def test_contexted_kv_attention_alibi(
     torch.cuda.synchronize()
     end_time = time.time()
     print(f"triton Time: {(end_time - start_time) * 1000:.2f} ms")
-    scale = float(1.0 / (head_size**0.5))
-
-    # NOTE(DefTruth): In order to reuse _make_alibi_bias function,
-    # we have to pad query tensor before MQA/GQA expanding.
-    if query.shape[0] != key.shape[0]:
-        query_pad = torch.empty(sum(seq_lens), num_heads, head_size, dtype=dtype)
-        query_pad.uniform_(-1e-3, 1e-3)
-        seq_start = 0
-        query_start = 0
-        for i, (query_len, seq_len) in enumerate(zip(query_lens, seq_lens)):
-            seq_end = seq_start + seq_len
-            query_end = query_start + query_len
-            query_pad[seq_start:seq_end, ...] = torch.cat(
-                [
-                    torch.zeros(seq_len - query_len, num_heads, head_size, dtype=dtype),
-                    query[query_start:query_end, ...],
-                ],
-                dim=0,
-            )
-            seq_start += seq_len
-            query_start += query_len
-        query = query_pad
-
-    if num_kv_heads != num_heads:
-        # As of Nov 2023, xformers only supports MHA. For MQA/GQA,
-        # project the key and value tensors to the desired number of
-        # heads.
-        #
-        # see also: vllm/model_executor/layers/attention.py
-        key = key[:, :, None, :].expand(
-            key.shape[0], num_kv_heads, num_queries_per_kv, key.shape[-1]
-        )
-        value = value[:, :, None, :].expand(
-            value.shape[0], num_kv_heads, num_queries_per_kv, value.shape[-1]
-        )
-        # [seq, num_kv_heads, num_queries_per_kv, dk]=>
-        # [seq, num_kv_heads*num_queries_per_kv, dk] to comply with rest of the
-        # codebase. We save some time reshaping alibi matrix at runtime.
-        key = key.reshape(key.shape[0], -1, key.shape[-1])
-        value = value.reshape(value.shape[0], -1, value.shape[-1])
-    query = query.unsqueeze(0)
-    key = key.unsqueeze(0)
-    value = value.unsqueeze(0)
-
-    attn_bias = make_alibi_bias(alibi_slopes, num_kv_heads, dtype, seq_lens)
-    output_ref = torch.empty_like(output)
-    seq_start = 0
-    query_start = 0
+    torch.cuda.synchronize()
     start_time = time.time()
-    # Attention with alibi slopes.
-    # FIXME(DefTruth): Because xformers does not support dynamic sequence
-    # lengths with custom attention bias, we process each prompt one by
-    # one. This is inefficient, especially when we have many short prompts.
-    # modified from: vllm/v1/attention/backends/xformers.py#L343
-    for i, (query_len, seq_len) in enumerate(zip(query_lens, seq_lens)):
-        seq_end = seq_start + seq_len
-        query_end = query_start + query_len
-        out = xops.memory_efficient_attention_forward(
-            query[:, seq_start:seq_end],
-            key[:, seq_start:seq_end],
-            value[:, seq_start:seq_end],
-            attn_bias=attn_bias[i],
-            p=0.0,
-            scale=scale,
-        )
-        out = out.view_as(query[:, seq_start:seq_end]).view(
-            seq_len, num_heads, head_size
-        )
-        output_ref[query_start:query_end, ...].copy_(out[seq_len - query_len :, ...])
-        seq_start += seq_len
-        query_start += query_len
+    output_ref = _sdpa_reference(
+        query,
+        key,
+        value,
+        query_lens,
+        ctx_lens,
+        seq_lens,
+        num_heads,
+        num_kv_heads,
+        num_queries_per_kv,
+        head_size,
+        sliding_window=0,
+        alibi_slopes=alibi_slopes,
+    )
     torch.cuda.synchronize()
     end_time = time.time()
-    print(f"xformers Time: {(end_time - start_time) * 1000:.2f} ms")
+    print(f"sdpa Time: {(end_time - start_time) * 1000:.2f} ms")
     atol = 1e-3 if "fp8" in kv_cache_dtype else 1e-6
     torch.testing.assert_close(output, output_ref, atol=atol, rtol=0)
 
